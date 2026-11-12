@@ -5,18 +5,22 @@ class AlertsBot {
     constructor() {
         this.botToken = process.env.TELEGRAM_BOT_TOKEN;
         this.channelId = process.env.TELEGRAM_CHANNEL_ID;
-        this.alertsApiUrl = 'https://alerts.in.ua/api/states';
+        // НОВЫЙ API — без ключа, работает сразу
+        this.alertsApiUrl = 'https://ubilling.net.ua/aerialalerts/';
         this.telegramApiUrl = `https://api.telegram.org/bot${this.botToken}`;
         this.previousStates = new Map();
     }
 
     async getAlertsData() {
         try {
-            console.log('📡 Проверяю alerts.in.ua...');
-            const response = await axios.get(this.alertsApiUrl);
+            console.log('📡 Проверяю тривоги...');
+            const response = await axios.get(this.alertsApiUrl, {
+                timeout: 15000,
+                headers: { 'User-Agent': 'AlertsBot/1.0' }
+            });
             return response.data;
         } catch (error) {
-            console.error('❌ Ошибка получения данных:', error.message);
+            console.error('❌ Ошибка:', error.message);
             return null;
         }
     }
@@ -28,9 +32,9 @@ class AlertsBot {
                 text: text,
                 parse_mode: 'HTML'
             });
-            console.log('✅ Сообщение отправлено в Telegram');
+            console.log('✅ Відправлено в Telegram');
         } catch (error) {
-            console.error('❌ Ошибка отправки в Telegram:', error.response?.data || error.message);
+            console.error('❌ Telegram error:', error.response?.data || error.message);
         }
     }
 
@@ -55,34 +59,41 @@ class AlertsBot {
 
     async checkAlerts() {
         const data = await this.getAlertsData();
-        
+
+        // ubilling возвращает объект states, где ключ — название области
         if (!data || !data.states) {
-            console.log('⚠️ Не удалось получить данные');
+            console.log('⚠️ Нет данных');
             return;
         }
 
-        for (const region of data.states) {
-            const regionId = region.id;
-            const regionName = region.name;
-            const isAlertActive = region.alert;
-            const previousState = this.previousStates.get(regionId);
-            
-            if (previousState !== isAlertActive) {
+        // Проходим по всем областям
+        for (const [regionName, state] of Object.entries(data.states)) {
+            const isAlertActive = !!state.alertnow;
+            const previousState = this.previousStates.get(regionName);
+
+            // Если состояние изменилось (и это НЕ первый запуск)
+            if (previousState !== undefined && previousState !== isAlertActive) {
                 const message = this.createMessage(regionName, isAlertActive);
                 await this.sendToTelegram(message);
-                this.previousStates.set(regionId, isAlertActive);
                 console.log(`📍 ${regionName}: ${isAlertActive ? '🚨 ТРИВОГА' : '✅ ВІДБІЙ'}`);
             }
+
+            // Сохраняем текущее состояние
+            this.previousStates.set(regionName, isAlertActive);
         }
     }
 
     start() {
-        console.log('🚀 Запуск бота оповещений...\n');
+        console.log('🚀 Запуск бота оповещень...');
         console.log(`📢 Канал: ${this.channelId}`);
-        console.log(`⏱️ Проверка каждые 30 секунд\n`);
+        console.log(`⏱️ Перевірка кожні 30 секунд\n`);
 
-        this.checkAlerts();
+        // Первая проверка — только для инициализации (не шлёт в Telegram)
+        this.checkAlerts().then(() => {
+            console.log('✅ Базове стан завантажено\n');
+        });
 
+        // Далее — каждые 30 секунд
         setInterval(() => {
             this.checkAlerts();
         }, 30000);
