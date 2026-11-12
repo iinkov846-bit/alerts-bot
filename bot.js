@@ -9,6 +9,9 @@ class AlertsBot {
         this.telegramApiUrl = `https://api.telegram.org/bot${this.botToken}`;
         this.previousActive = new Set();
         this.isFirstRun = true;
+        this.pendingAlerts = []; // Очередь изменений
+        this.lastSendTime = 0; // Время последней отправки
+        this.minInterval = 3000; // Минимум 3 секунды между сообщениями
     }
 
     async getAlertsData() {
@@ -26,87 +29,20 @@ class AlertsBot {
 
     async sendToTelegram(text) {
         try {
+            // Ждем, если прошло меньше 3 секунд с последней отправки
+            const now = Date.now();
+            const timeSinceLastSend = now - this.lastSendTime;
+            if (timeSinceLastSend < this.minInterval) {
+                await new Promise(resolve => 
+                    setTimeout(resolve, this.minInterval - timeSinceLastSend)
+                );
+            }
+
             await axios.post(`${this.telegramApiUrl}/sendMessage`, {
                 chat_id: this.channelId,
                 text: text,
                 parse_mode: 'HTML'
             });
+            this.lastSendTime = Date.now();
             console.log('✅ Повідомлення відправлено в Telegram');
             return true;
-        } catch (error) {
-            console.error('❌ Помилка Telegram:', error.response?.data || error.message);
-            return false;
-        }
-    }
-
-    createMessage(locationName, isAlertActive) {
-        const time = new Date().toLocaleString('uk-UA', {
-            timeZone: 'Europe/Kiev',
-            hour: '2-digit',
-            minute: '2-digit'
-        });
-
-        if (isAlertActive) {
-            return `🚨 <b>ПОВІТРЯНА ТРИВОГА</b> 🚨\n\n📍 <b>${locationName}</b>\n⏰ ${time}`;
-        } else {
-            return `✅ <b>ВІДБІЙ ТРИВОГИ</b> ✅\n\n📍 <b>${locationName}</b>\n⏰ ${time}`;
-        }
-    }
-
-    async checkAlerts() {
-        const data = await this.getAlertsData();
-        if (!data) return;
-
-        const currentActive = new Set();
-
-        if (data.oblasts && Array.isArray(data.oblasts)) {
-            for (const item of data.oblasts) {
-                currentActive.add(item.name);
-                if (!this.previousActive.has(item.name)) {
-                    await this.sendToTelegram(this.createMessage(item.name, true));
-                }
-            }
-        }
-
-        if (data.raions && Array.isArray(data.raions)) {
-            for (const item of data.raions) {
-                currentActive.add(item.name);
-                if (!this.previousActive.has(item.name)) {
-                    await this.sendToTelegram(this.createMessage(item.name, true));
-                }
-            }
-        }
-
-        if (!this.isFirstRun) {
-            for (const prevLocation of this.previousActive) {
-                if (!currentActive.has(prevLocation)) {
-                    await this.sendToTelegram(this.createMessage(prevLocation, false));
-                }
-            }
-        }
-
-        this.previousActive = currentActive;
-        this.isFirstRun = false;
-    }
-
-    start() {
-        console.log('🚀 Запуск бота...');
-        
-        // ОТПРАВЛЯЕМ ТЕСТОВОЕ СООБЩЕНИЕ ПРЯМО СЕЙЧАС
-        this.sendToTelegram("✅ <b>БОТ УСПЕШНО ЗАПУЩЕН!</b>\nЕсли ты видишь это сообщение — подключение к каналу работает корректно. Ожидаю изменений в тривогах...");
-
-        console.log(`📢 Канал: ${this.channelId}`);
-        console.log(`⏱️ Перевірка кожні 30 секунд`);
-
-        this.checkAlerts().then(() => {
-            console.log('✅ Базовий стан завантажено.\n');
-        });
-
-        setInterval(() => {
-            this.checkAlerts();
-        }, 30000);
-    }
-}
-
-const bot = new AlertsBot();
-bot.start();
