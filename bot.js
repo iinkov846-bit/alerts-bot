@@ -1,147 +1,211 @@
 const axios = require('axios');
-require('dotenv').config();
 
-class AlertsBot {
-    constructor() {
-        this.botToken = process.env.TELEGRAM_BOT_TOKEN;
-        this.channelId = process.env.TELEGRAM_CHANNEL_ID;
-        this.alertsApiUrl = 'https://neptun.in.ua/api/v1/alerts';
-        this.telegramApiUrl = `https://api.telegram.org/bot${this.botToken}`;
-        this.previousActive = new Set();
-        this.isFirstRun = true;
-        this.lastSendTime = 0;
-        this.minInterval = 3500;
-    }
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+const ALERTS_URL = 'https://neptun.in.ua/api/v1/alerts';
+const THREATS_URL = 'https://neptun.in.ua/api/v1/threats';
 
-    async getAlertsData() {
-        try {
-            const response = await axios.get(this.alertsApiUrl, {
-                timeout: 15000,
-                headers: { 'User-Agent': 'AlertsBot/1.0' }
-            });
-            return response.data;
-        } catch (error) {
-            console.error('❌ Помилка запиту NEPTUN:', error.message);
-            return null;
-        }
-    }
+const CHECK_INTERVAL = 30000;   // проверка каждые 30 сек
+const MIN_SEND_INTERVAL = 3500; // пауза между сообщениями (защита от 429)
+const MASS_ATTACK_THRESHOLD = 10; // сколько угроз = "массовая атака"
 
-    async sendToTelegram(text) {
-        try {
-            const now = Date.now();
-            const timeSinceLastSend = now - this.lastSendTime;
-            if (timeSinceLastSend < this.minInterval) {
-                await new Promise(resolve => 
-                    setTimeout(resolve, this.minInterval - timeSinceLastSend)
-                );
-            }
+let lastSendTime = 0;
+let isFirstRun = true;
+let massAttackActive = false;
 
-            await axios.post(`${this.telegramApiUrl}/sendMessage`, {
-                chat_id: this.channelId,
-                text: text,
-                parse_mode: 'HTML'
-            });
-            this.lastSendTime = Date.now();
-            console.log('✅ Повідомлення відправлено в Telegram');
-            return true;
-        } catch (error) {
-            console.error('❌ Помилка Telegram:', error.response?.data || error.message);
-            return false;
-        }
-    }
-    
-    createGroupedMessage(alerts) {
-        const time = new Date().toLocaleString('uk-UA', {
-            timeZone: 'Europe/Kiev',
-            hour: '2-digit',
-            minute: '2-digit'
-        });
+let knownAlerts = new Set();   // активные тривоги
+let knownThreats = new Set();  // активные угрозы (по id)
 
-        const newAlerts = alerts.filter(a => a.isActive);
-        const cancelledAlerts = alerts.filter(a => !a.isActive);
+const HEADERS = { 'User-Agent': 'NEBO-MONITOR/2.0' };
 
-        let message = `📊 <b>ЗМІНИ ПОВІТРЯНИХ ТРИВОГ</b>\n⏰ ${time}\n\n`;
+// Описание типов угроз
+const TYPE_META = {
+    mig31k:    { emoji: '🛩', name: 'МіГ-31К — носій «Кинджалу»' },
+    ballistic: { emoji: '🚀', name: 'Балістична ракета' },
+    missile:   { emoji: '🚀', name: 'Крилата ракета' },
+    kab:       { emoji: '💣', name: 'Керована авіабомба (КАБ)' },
+    uav:       { emoji: '🛩', name: 'БПЛА (Шахед / дрон)' },
+    recon:     { emoji: '🔍', name: 'Розвідувальний дрон' },
+    unknown:   { emoji: '❓', name: 'Невідома загроза' }
+};
 
-        if (newAlerts.length > 0) {
-            message += `🚨 <b>ТРИВОГА ОГОЛОШЕНА:</b>\n`;
-            newAlerts.forEach(alert => {
-                message += `• ${alert.locationName}\n`;
-            });
-            message += `\n`;
-        }
+// Экранирование HTML (чтобы Telegram не падал на символах < > &)
+function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
-        if (cancelledAlerts.length > 0) {
-            message += `✅ <b>ВІДБІЙ ТРИВОГИ:</b>\n`;
-            cancelledAlerts.forEach(alert => {
-                message += `• ${alert.locationName}\n`;
-            });
-        }
+// Градусы -> стороны света
+function degToCompass(deg) {
+    if (deg === null || deg === undefined) return null;
+    const dirs = ['Пн', 'ПнСх', 'Сх', 'ПдСх', 'Пд', 'ПдЗх', 'Зх', 'ПнЗх'];
+    return dirs[Math.round(((deg % 360) / 45)) % 8];
+}
 
-        return message;
-    }
+// Отправка с защитой от лимитов Telegram
+async function sendToTelegram(text) {
+    const now = Date.now();
+    const wait = lastSendTime + MIN_SEND_INTERVAL - now;
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
 
-    async checkAlerts() {
-        const data = await this.getAlertsData();
-        if (!data) return;
-
-        const currentActive = new Set();
-        const changes = [];
-
-        if (data.oblasts && Array.isArray(data.oblasts)) {
-            for (const item of data.oblasts) {
-                currentActive.add(item.name);
-            }
-        }
-
-        if (data.raions && Array.isArray(data.raions)) {
-            for (const item of data.raions) {
-                currentActive.add(item.name);
-            }
-        }
-
-        if (this.isFirstRun) {
-            this.previousActive = currentActive;
-            this.isFirstRun = false;
-            console.log('✅ Базовий стан завантажено. Очікування змін...');
-            return;
-        }
-
-        for (const location of currentActive) {
-            if (!this.previousActive.has(location)) {
-                changes.push({ locationName: location, isActive: true });
-            }
-        }
-
-        for (const location of this.previousActive) {
-            if (!currentActive.has(location)) {
-                changes.push({ locationName: location, isActive: false });
-            }
-        }
-
-        if (changes.length > 0) {
-            const message = this.createGroupedMessage(changes);
-            await this.sendToTelegram(message);
-            console.log(`📝 Відправлено ${changes.length} змін`);
-        }
-
-        this.previousActive = currentActive;
-    }
-
-    start() {
-        console.log('🚀 Запуск бота...');
-        
-        this.sendToTelegram("✅ <b>БОТ ЗАПУЩЕНО!</b>\nРадар тривог активний. Очікую змін...");
-
-        console.log(`📢 Канал: ${this.channelId}`);
-        console.log(`⏱️ Перевірка кожні 30 секунд\n`);
-
-        this.checkAlerts();
-
-        setInterval(() => {
-            this.checkAlerts();
-        }, 30000);
+    try {
+        await axios.post('https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage', {
+            chat_id: CHANNEL_ID,
+            text: text,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+        }, { timeout: 10000 });
+        lastSendTime = Date.now();
+        console.log('✅ Sent');
+    } catch (e) {
+        console.error('❌ TG:', e.response ? JSON.stringify(e.response.data) : e.message);
     }
 }
 
-const bot = new AlertsBot();
-bot.start();
+// Сообщение об одной угрозе
+function threatMessage(t) {
+    const meta = TYPE_META[t.type] || TYPE_META.unknown;
+
+    // МиГ-31К — отдельный критический формат
+    if (t.type === 'mig31k') {
+        return '🚨 <b>ЗЛІТ МІГ-31К — НОСІЙ «КИНДЖАЛУ»</b>\n' +
+               '⏱ Час до можливого удару: 15-20 хв\n' +
+               '🚨 <b>ТЕРМІНОВО В УКРИТТЯ!</b>';
+    }
+
+    let loc = t.locality || t.district || t.region || 'Україна';
+    let msg = meta.emoji + ' <b>' + esc(meta.name) + '</b>\n📍 ' + esc(loc);
+    if (t.region && t.locality && t.region !== t.locality) {
+        msg += ', ' + esc(t.region);
+    }
+
+    // advisory = спостереження, а не сигнал ховатися
+    if (t.advisory === true) {
+        msg = '👀 <b>Спостереження</b> (не сигнал ховатися)\n' + msg;
+    }
+
+    if (!t.areaOnly && t.heading !== null && t.heading !== undefined) {
+        msg += '\n🧭 Курс: ' + degToCompass(t.heading) + ' (' + t.heading + '°)';
+    }
+    if (t.velocity && t.velocity.speedKmh) {
+        msg += '\n⚡ Швидкість: ' + t.velocity.speedKmh + ' км/год';
+    }
+    if (t.count && t.count > 1) {
+        msg += '\n🔢 Кількість: ' + t.count;
+    }
+    if (t.explanationShort) {
+        msg += '\n💬 ' + esc(t.explanationShort);
+    }
+    return msg;
+}
+
+// Обработка угроз
+async function handleThreats(threats) {
+    const active = threats.filter(t => !t.status || t.status === 'active');
+
+    // Массовая атака
+    const combat = active.filter(t => t.advisory !== true);
+    if (!massAttackActive && combat.length >= MASS_ATTACK_THRESHOLD) {
+        massAttackActive = true;
+        if (!isFirstRun) {
+            await sendToTelegram(
+                '🔴🔴🔴 <b>МАСОВАНА АТАКА</b> 🔴🔴🔴\n' +
+                '☠️ У повітрі загроз: ' + combat.length + '\n' +
+                '🚨 <b>НЕ ІГНОРУЙТЕ СИРЕНИ! БУДЬТЕ В УКРИТТЯХ!</b>'
+            );
+        }
+    } else if (massAttackActive && combat.length < MASS_ATTACK_THRESHOLD) {
+        massAttackActive = false;
+        if (!isFirstRun) {
+            await sendToTelegram('🟠 Інтенсивність атаки знизилась. Загроз у повітрі: ' + combat.length + '. Залишайтесь обережними.');
+        }
+    }
+
+    // Новые угрозы
+    const newThreats = active.filter(t => !knownThreats.has(t.id));
+
+    if (isFirstRun) {
+        // Тихий старт: просто запоминаем, не спамим
+        knownThreats = new Set(active.map(t => t.id));
+        return;
+    }
+
+    knownThreats = new Set(active.map(t => t.id));
+
+    // МиГ-31К шлем немедленно и отдельно
+    for (const t of newThreats) {
+        if (t.type === 'mig31k') {
+            await sendToTelegram(threatMessage(t));
+        }
+    }
+
+    // Остальные новые угрозы — одним групповым сообщением
+    const others = newThreats.filter(t => t.type !== 'mig31k');
+    if (others.length > 0) {
+        let text = '🛰 <b>НОВІ ЗАГРОЗИ У ПОВІТРІ (' + others.length + '):</b>\n\n';
+        const parts = others.map(threatMessage);
+        text += parts.join('\n\n――――――――――\n\n');
+
+        // Защита от слишком длинного сообщения
+        if (text.length > 4000) text = text.substring(0, 4000) + '\n…';
+        await sendToTelegram(text);
+    }
+}
+
+// Обработка официальных тривог
+async function handleAlerts(data) {
+    const current = new Set();
+    if (data.oblasts) data.oblasts.forEach(o => current.add(o.name));
+    if (data.raions) data.raions.forEach(r => current.add(r.name));
+
+    if (isFirstRun) {
+        knownAlerts = current;
+        return;
+    }
+
+    const started = [];
+    const ended = [];
+    current.forEach(n => { if (!knownAlerts.has(n)) started.push(n); });
+    knownAlerts.forEach(n => { if (!current.has(n)) ended.push(n); });
+
+    if (started.length > 0 || ended.length > 0) {
+        let text = '📊 <b>ЗМІНИ ПОВІТРЯНИХ ТРИВОГ</b>\n\n';
+        if (started.length > 0) {
+            text += '🚨 <b>ТРИВОГА:</b>\n' + started.map(n => '• ' + esc(n)).join('\n') + '\n';
+        }
+        if (ended.length > 0) {
+            text += '✅ <b>ВІДБІЙ:</b>\n' + ended.map(n => '• ' + esc(n)).join('\n');
+        }
+        await sendToTelegram(text);
+    }
+
+    knownAlerts = current;
+}
+
+// Главный цикл проверки
+async function check() {
+    try {
+        const tRes = await axios.get(THREATS_URL, { headers: HEADERS, timeout: 15000 });
+        await handleThreats((tRes.data && tRes.data.threats) || []);
+    } catch (e) {
+        console.error('❌ threats fail:', e.message);
+    }
+
+    try {
+        const aRes = await axios.get(ALERTS_URL, { headers: HEADERS, timeout: 15000 });
+        await handleAlerts(aRes.data || {});
+    } catch (e) {
+        console.error('❌ alerts fail:', e.message);
+    }
+
+    if (isFirstRun) {
+        isFirstRun = false;
+        console.log('✅ Базовий стан завантажено. Моніторинг активний.');
+    }
+}
+
+console.log('🛰 НЕБО.МОНІТОР v2 запущено');
+console.log('📢 Канал:', CHANNEL_ID ? 'OK' : 'MISSING');
+console.log('🔑 Токен:', BOT_TOKEN ? 'OK' : 'MISSING');
+
+check();
+setInterval(check, CHECK_INTERVAL);
